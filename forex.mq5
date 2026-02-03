@@ -134,6 +134,7 @@ input group "=== CRYPTO RISK MODEL (SEPARATE) ==="
 input ENUM_ONOFF Use_Crypto_Risk_Separate = ON;
 input double Crypto_SL_ATR_Mult_BTC = 1.25;   // SL = ATR * mult (BTC)
 input double Crypto_SL_ATR_Mult_ETH = 1.20;   // ETH
+input double CryptoSLBufferPoints   = 5.0;    // Buffer in points for crypto SL (confirm candle extreme)
 
 // USC cent support
 input ENUM_ONOFF AutoDetectCentAccount = ON;
@@ -366,8 +367,9 @@ int DayKey(datetime t)
 // FORWARD DECLARATIONS
 //==================================================================
 bool   IsCryptoSymbol(const string sym);
+bool   IsSymbolTFAllowed(const string sym, ENUM_TIMEFRAMES tf);
 double CalcVolCrypto_ByRisk(const string sym, ENUM_TIMEFRAMES tf, DirType dir,
-                            double entry, double sl, double riskMoney);
+                            double entry, double sl, double riskMoney, const MqlRates &confirmCandle);
 
 bool IsNearHTFExtreme(const string sym, DirType dir, double rsiTF,
                       double &distToExtreme, ENUM_TIMEFRAMES &whichTF);
@@ -389,7 +391,6 @@ double LossPerLotToSL(string sym, DirType dir, double entry, double sl);
 string ZoneRoleToStr(ZoneRole r);
 void   EvaluateZoneRole(const MqlRates &r[], int bars, double atr, SRBox &box);
 
-double GetADX(const string sym, ENUM_TIMEFRAMES tf);
 double RoleRiskMult(ZoneRole role);
 
 void   Log(const string s);
@@ -1289,6 +1290,8 @@ bool TryConfirmSweep(const string sym, ENUM_TIMEFRAMES tf, const MqlRates &cur, 
       box.mid = g_sweeps[i].mid;
       box.strength = 0;
       box.kind = (g_sweeps[i].dir==DIR_LONG ? BOX_SUPPORT : BOX_RESISTANCE);
+      box.role = g_sweeps[i].role;
+      box.roleScore = g_sweeps[i].roleScore;
 
       double buf = (atr>0 ? atr*Sweep_Confirm_ATR_Buffer : 0.0);
 
@@ -1765,22 +1768,65 @@ bool IsCryptoSymbol(const string sym)
    return (StringFind(sym, "BTC") >= 0 || StringFind(sym, "ETH") >= 0);
 }
 
+// Symbol-specific timeframe filtering
+// XAU/XAG/EUR/GBP: M5+M15 only
+// BTC/ETH: M5+M15+H1+H4
+bool IsSymbolTFAllowed(const string sym, ENUM_TIMEFRAMES tf)
+{
+   // Crypto symbols: M5, M15, H1, H4
+   if(IsCryptoSymbol(sym))
+   {
+      return (tf == PERIOD_M5 || tf == PERIOD_M15 || tf == PERIOD_H1 || tf == PERIOD_H4);
+   }
+   
+   // Forex/Metals (XAU/XAG/EUR/GBP): M5 and M15 only
+   if(StringFind(sym, "XAU") >= 0 || StringFind(sym, "XAG") >= 0 ||
+      StringFind(sym, "EUR") >= 0 || StringFind(sym, "GBP") >= 0)
+   {
+      return (tf == PERIOD_M5 || tf == PERIOD_M15);
+   }
+   
+   // Default: allow all timeframes for other symbols
+   return true;
+}
+
 // Volume theo risk cho crypto CFD: dùng tick value/size chuẩn của symbol
+// Updated: SL calculation now based on confirm candle extreme + buffer
 double CalcVolCrypto_ByRisk(const string sym, ENUM_TIMEFRAMES tf, DirType dir,
-                            double entry, double sl, double riskMoney)
+                            double entry, double sl, double riskMoney, const MqlRates &confirmCandle)
 {
    if(riskMoney <= 0.0) return 0.0;
 
    double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
    if(pt <= 0.0) return 0.0;
+   
+   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0.0) return 0.0;
+
+   // For crypto: SL based on confirm candle extreme + buffer (not ATR)
+   double bufferPrice = CryptoSLBufferPoints * pt;
+   double actualSL = sl;
+   
+   if(dir == DIR_LONG)
+   {
+      // Long: SL below confirm candle low
+      actualSL = confirmCandle.low - bufferPrice;
+   }
+   else
+   {
+      // Short: SL above confirm candle high
+      actualSL = confirmCandle.high + bufferPrice;
+   }
+   
+   // Normalize to tick size
+   actualSL = MathRound(actualSL / tickSize) * tickSize;
 
    // khoảng SL tính theo points
-   double distPoints = MathAbs(entry - sl) / pt;
+   double distPoints = MathAbs(entry - actualSL) / pt;
    if(distPoints <= 0.0) return 0.0;
 
    double tickVal  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-   if(tickVal <= 0.0 || tickSize <= 0.0) return 0.0;
+   if(tickVal <= 0.0) return 0.0;
 
    // risk cho 1 lot = distPoints * (tickVal/tickSize)
    // vì 1 tickSize ứng với tickVal tiền
@@ -1791,22 +1837,27 @@ double CalcVolCrypto_ByRisk(const string sym, ENUM_TIMEFRAMES tf, DirType dir,
    return NormalizeVolume(sym, vol);
 }
 
-// RR filter (>= RR_Min)
+// RR filter (>= RR_Min) - Updated to use average entry price
 bool RRAllow(const Signal &s)
 {
    if(s.tp_count <= 0 || s.entry_count <= 0) return false;
 
-   double entry = s.entries[0];
+   // Calculate average entry price
+   double avgEntry = 0.0;
+   for(int i = 0; i < s.entry_count; i++)
+      avgEntry += s.entries[i];
+   avgEntry /= (double)s.entry_count;
+
    double sl    = s.sl;
    double tp1   = s.tps[0];
 
-   double risk   = MathAbs(entry - sl);
-   double reward = MathAbs(tp1 - entry);
+   double risk   = MathAbs(avgEntry - sl);
+   double reward = MathAbs(tp1 - avgEntry);
    if(risk <= 0) return false;
 
    double rr = reward / risk;
-   Log(StringFormat("[RR] %s %s RR 1:%.2f (min 1:%.2f)",
-   s.symbol, TFToLabel(s.tf), rr, RR_Min
+   Log(StringFormat("[RR] %s %s RR 1:%.2f (min 1:%.2f) | Avg Entry=%.5f",
+   s.symbol, TFToLabel(s.tf), rr, RR_Min, avgEntry
 ));
 
    return (rr >= RR_Min);
@@ -2207,7 +2258,7 @@ bool PlaceSignal(const Signal &s)
    string msg =
    icon + " SIGNAL " + side + " " + s.symbol +
    " | TF:" + TFToLabel(s.tf) +
-   " | RR:" + DoubleToString(rr, 2) + "n" +
+   " | RR:" + DoubleToString(rr, 2) + "\n" +
    "1️⃣ " + e1 + "  |  2️⃣ " + e2 + "  |  3️⃣ " + e3 + "\n" +
    "🛑 SL: " + DoubleToString(s.sl, _Digits) + "\n" +
    "🎯 TP: " + DoubleToString(tp1, _Digits);
@@ -2303,8 +2354,16 @@ for(int i=0;i<nE;i++)
 // ===== SEPARATE RISK FOR CRYPTO =====
 if(Use_Crypto_Risk_Separate==ON && IsCryptoSymbol(s.symbol))
 {
+   // Build confirm candle from signal data
+   MqlRates confirmCandle;
+   confirmCandle.high = s.curHigh;
+   confirmCandle.low = s.curLow;
+   confirmCandle.close = s.curClose;
+   confirmCandle.open = s.curOpen;
+   
    // dùng entry & SL thật của từng entry => chia risk đúng
-   vol = CalcVolCrypto_ByRisk(s.symbol, s.tf, s.dir, entry, s.sl, riskMoney_i);
+   // For crypto: SL is based on confirm candle extreme (handled inside CalcVolCrypto_ByRisk)
+   vol = CalcVolCrypto_ByRisk(s.symbol, s.tf, s.dir, entry, s.sl, riskMoney_i, confirmCandle);
 
    if(VerboseLogs==ON)
       Log(StringFormat("[CRYPTO RISK] %s E%d alloc=%.2f$ vol=%.4f",
@@ -2350,11 +2409,62 @@ if(vol <= 0) continue;
    string cmt = StringFormat("E%d|%s|%s|TP1=%.5f",
                              (i+1), s.reason, TFToLabel(s.tf), tp1);
 
+   // Safety checks for stops level and freeze level
+   double tickSize = SymbolInfoDouble(s.symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0.0) tickSize = pt;
+   
+   // Normalize prices to tick size
+   double normalizedEntry = MathRound(entry / tickSize) * tickSize;
+   double normalizedSL = MathRound(s.sl / tickSize) * tickSize;
+   double normalizedTP = MathRound(tp1 / tickSize) * tickSize;
+   
+   // Check stops level
+   long stopsLevel = SymbolInfoInteger(s.symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopsLevelPrice = stopsLevel * pt;
+   
+   double bid = SymbolInfoDouble(s.symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(s.symbol, SYMBOL_ASK);
+   
+   if(s.dir == DIR_LONG)
+   {
+      // For buy limit: entry must be below ask by at least stops level
+      if(normalizedEntry >= ask - stopsLevelPrice && stopsLevel > 0)
+      {
+         if(VerboseLogs==ON)
+            Log(StringFormat("[STOPS LEVEL] %s E%d entry too close to market", s.symbol, (i+1)));
+         continue;
+      }
+      // SL distance check
+      if(MathAbs(normalizedEntry - normalizedSL) < stopsLevelPrice && stopsLevel > 0)
+      {
+         if(VerboseLogs==ON)
+            Log(StringFormat("[STOPS LEVEL] %s E%d SL too close to entry", s.symbol, (i+1)));
+         continue;
+      }
+   }
+   else
+   {
+      // For sell limit: entry must be above bid by at least stops level
+      if(normalizedEntry <= bid + stopsLevelPrice && stopsLevel > 0)
+      {
+         if(VerboseLogs==ON)
+            Log(StringFormat("[STOPS LEVEL] %s E%d entry too close to market", s.symbol, (i+1)));
+         continue;
+      }
+      // SL distance check
+      if(MathAbs(normalizedSL - normalizedEntry) < stopsLevelPrice && stopsLevel > 0)
+      {
+         if(VerboseLogs==ON)
+            Log(StringFormat("[STOPS LEVEL] %s E%d SL too close to entry", s.symbol, (i+1)));
+         continue;
+      }
+   }
+
    bool ok=false;
    if(s.dir==DIR_LONG)
-      ok = trade.BuyLimit(vol, entry, s.symbol, s.sl, tp1, ORDER_TIME_GTC, 0, cmt);
+      ok = trade.BuyLimit(vol, normalizedEntry, s.symbol, normalizedSL, normalizedTP, ORDER_TIME_GTC, 0, cmt);
    else
-      ok = trade.SellLimit(vol, entry, s.symbol, s.sl, tp1, ORDER_TIME_GTC, 0, cmt);
+      ok = trade.SellLimit(vol, normalizedEntry, s.symbol, normalizedSL, normalizedTP, ORDER_TIME_GTC, 0, cmt);
 
    if(ok)
    {
@@ -2399,6 +2509,41 @@ bool LoadTP1ForTicket(long ticket, double &tp1, bool &hit1, bool &trailOn)
 
 bool ParseTPFromComment(string cmt, string key, double &outVal)
 {
+   int pos = StringFind(cmt, key);
+   if(pos<0) return false;
+   string sub = StringSubstr(cmt, pos+StringLen(key));
+   outVal = StringToDouble(sub);
+   return true;
+}
+
+// Helper: Calculate average entry price for all positions with same symbol and direction
+double CalcAvgEntryPrice(string sym, long posType)
+{
+   double totalVol = 0.0;
+   double weightedPrice = 0.0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0) continue;
+      if(!PositionSelectByTicket(tk)) continue;
+      
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym) continue;
+      if(PositionGetInteger(POSITION_TYPE) != posType) continue;
+      
+      double vol = PositionGetDouble(POSITION_VOLUME);
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      weightedPrice += price * vol;
+      totalVol += vol;
+   }
+   
+   if(totalVol > 0.0)
+      return weightedPrice / totalVol;
+   
+   return 0.0;
+}
    outVal = 0.0;
    int p = StringFind(cmt, key+"=");
    if(p < 0) return false;
@@ -2508,41 +2653,15 @@ void ManageTPMilestones()
       {
          double cur = (type==POSITION_TYPE_BUY)? bid : ask;
 
-         double risk = MathAbs(openPrice - sl);
+         // Use average entry price for RR calculation
+         double avgEntry = CalcAvgEntryPrice(sym, type);
+         if(avgEntry <= 0.0) avgEntry = openPrice; // fallback to single entry
+
+         double risk = MathAbs(avgEntry - sl);
          if(risk <= 0) continue;
 
-         double rr = (type==POSITION_TYPE_BUY) ? ((cur - openPrice) / risk)
-                                               : ((openPrice - cur) / risk);
-// ===== C5-A: AUTO BE @ 1R =====
-         if(rr >= 1.0)
-{
-         if(type==POSITION_TYPE_BUY && sl < openPrice)
-   {
-         trade.PositionModify(sym, openPrice, tp);
-         if(VerboseLogs==ON)
-         Log("[C5] BUY BE @1R " + sym);
-   }
-         if(type==POSITION_TYPE_SELL && sl > openPrice)
-   {
-         trade.PositionModify(sym, openPrice, tp);
-         if(VerboseLogs==ON)
-         Log("[C5] SELL BE @1R " + sym);
-   }
-}
-
-// ===== C5-B: CLOSE WORST ENTRY @ >=1.2R =====
-if(rr >= 1.2)
-{
-   static datetime lastCloseWorstTime = 0;
-   if(TimeCurrent() - lastCloseWorstTime > 30) // tránh spam
-   {
-      if(CloseWorstPositionBySymbol(sym, type))
-      {
-         lastCloseWorstTime = TimeCurrent();
-         TelegramSend("✂️ C5 CLOSE WORST ENTRY @1.2R " + sym);
-      }
-   }
-}
+         double rr = (type==POSITION_TYPE_BUY) ? ((cur - avgEntry) / risk)
+                                               : ((avgEntry - cur) / risk);
 
 // ===== C5-A: AUTO BE @ 1R =====
 if(rr >= 1.0)
@@ -2795,6 +2914,14 @@ void OnTimer()
       {
          ENUM_TIMEFRAMES tf = g_tfs[t];
 
+         // Apply symbol-specific timeframe filter
+         if(!IsSymbolTFAllowed(sym, tf))
+         {
+            if(VerboseLogs==ON)
+               Log(StringFormat("[SKIP TF] %s %s not allowed for this symbol", sym, TFToLabel(tf)));
+            continue;
+         }
+
          if(!SymbolSelect(sym,true)) continue;
          if(Bars(sym, tf) < 220) continue;
 
@@ -2821,7 +2948,12 @@ if(cur.time <= g_lastClosed[idx]) continue;
 
          SRBox boxes[];
          int bn = BuildSRBoxes(r, boxes);
-         if(bn<=0) continue;
+         if(bn<=0)
+         {
+            // Fix g_lastClosed processing: update even when SR build fails
+            g_lastClosed[idx] = cur.time;
+            continue;
+         }
          // TỚI ĐÂY MỚI SET
 g_lastClosed[idx] = cur.time;
          for(int i=0;i<bn;i++)
@@ -2872,6 +3004,15 @@ if(sc < need) continue;
 
 }
 
+// PassDistTF gate: only for ROLE_DISTRIBUTION zones in sweep signals too
+if(!PassDistTF(tf, sweepSig.box))
+{
+   if(VerboseLogs==ON)
+      Log(StringFormat("[DIST GATE] %s %s DIST roleScore=%d < min=%d (sweep)",
+         sym, TFToLabel(tf), sweepSig.box.roleScore, GetDistMinByTF(tf)));
+   continue;
+}
+
 
 if(PlaceSignal(sweepSig))
 {
@@ -2908,6 +3049,15 @@ if(PlaceSignal(sweepSig))
 
 if(Use_Candle_Confirm==ON && !ConfirmEntryCandleOnly(sg)) continue;
 if(Use_RR_Gate==ON && !RRAllow(sg)) continue;
+
+// PassDistTF gate: only for ROLE_DISTRIBUTION zones
+if(!PassDistTF(sg.tf, sg.box))
+{
+   if(VerboseLogs==ON)
+      Log(StringFormat("[DIST GATE] %s %s DIST roleScore=%d < min=%d",
+         sg.symbol, TFToLabel(sg.tf), sg.box.roleScore, GetDistMinByTF(sg.tf)));
+   continue;
+}
 
 // SCORE gate (đặt TRƯỚC khi place)
 if(Use_Score_Filter==ON)
@@ -2982,19 +3132,22 @@ void ManageScalpRRRescue()
       // =========================
       if(buyCnt>=2 && anyBuy!=0 && PositionSelectByTicket(anyBuy))
       {
-         double op  = PositionGetDouble(POSITION_PRICE_OPEN);
          double sl  = PositionGetDouble(POSITION_SL);
          double tp  = PositionGetDouble(POSITION_TP);
          double bid = SymbolInfoDouble(sym,SYMBOL_BID);
 
-         double risk = MathAbs(op - sl);
+         // Use average entry price for RR calculation
+         double avgEntry = CalcAvgEntryPrice(sym, POSITION_TYPE_BUY);
+         if(avgEntry <= 0.0) avgEntry = PositionGetDouble(POSITION_PRICE_OPEN); // fallback
+
+         double risk = MathAbs(avgEntry - sl);
          if(risk>0)
          {
-            double rr = (bid - op) / risk;
+            double rr = (bid - avgEntry) / risk;
 
-            // RR >= BE: kéo SL về entry
-            if(rr >= RR_BE_At && sl < op)
-               trade.PositionModify(anyBuy, op, tp);
+            // RR >= BE: kéo SL về avg entry
+            if(rr >= RR_BE_At && sl < avgEntry)
+               trade.PositionModify(anyBuy, avgEntry, tp);
 
             // RR >= 2R: đóng WORST entry 1 lần
             if(rr >= RR_Take1 &&
@@ -3047,19 +3200,22 @@ void ManageScalpRRRescue()
       // =========================
       if(sellCnt>=2 && anySell!=0 && PositionSelectByTicket(anySell))
       {
-         double op  = PositionGetDouble(POSITION_PRICE_OPEN);
          double sl  = PositionGetDouble(POSITION_SL);
          double tp  = PositionGetDouble(POSITION_TP);
          double ask = SymbolInfoDouble(sym,SYMBOL_ASK);
 
-         double risk = MathAbs(sl - op);
+         // Use average entry price for RR calculation
+         double avgEntry = CalcAvgEntryPrice(sym, POSITION_TYPE_SELL);
+         if(avgEntry <= 0.0) avgEntry = PositionGetDouble(POSITION_PRICE_OPEN); // fallback
+
+         double risk = MathAbs(sl - avgEntry);
          if(risk>0)
          {
-            double rr = (op - ask) / risk;
+            double rr = (avgEntry - ask) / risk;
 
-            // RR >= BE: kéo SL về entry
-            if(rr >= RR_BE_At && sl > op)
-               trade.PositionModify(anySell, op, tp);
+            // RR >= BE: kéo SL về avg entry
+            if(rr >= RR_BE_At && sl > avgEntry)
+               trade.PositionModify(anySell, avgEntry, tp);
 
             // RR >= 2R: đóng WORST entry 1 lần
             if(rr >= RR_Take1 &&
